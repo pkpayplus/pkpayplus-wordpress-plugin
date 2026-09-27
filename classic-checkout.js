@@ -2,11 +2,104 @@
     'use strict';
 
     var settings = window.pkplus_classic_settings || {};
+    var checkoutFlow = settings.checkout_flow || 'iframe';
+    var diagnosticUrlTemplate = settings.diagnostic_url || '';
+    var diagnosticAjaxUrl = settings.diagnostic_ajax_url || '';
     var frame = null;
     var session = null;
     var paymentComplete = false;
     var submitting = false;
     var creating = false;
+    var lastReportedWooError = '';
+
+    function sendDiagnostic(event, data, level, message) {
+        if (!session || !session.session_id || (!diagnosticUrlTemplate && !diagnosticAjaxUrl)) return;
+        var directUrl = diagnosticUrlTemplate.replace('{session_id}', encodeURIComponent(session.session_id));
+        var url = diagnosticAjaxUrl
+            ? diagnosticAjaxUrl + '&_wpnonce=' + encodeURIComponent(settings.nonce || '')
+            : directUrl;
+        fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                event: event,
+                session_id: session.session_id,
+                level: level || 'info',
+                message: message || '',
+                data: data || {},
+                url: window.location.href
+            }),
+            keepalive: true
+        }).catch(function () {});
+    }
+
+    function textFromError(value) {
+        if (typeof value === 'string') {
+            var node = document.createElement('div');
+            node.innerHTML = value;
+            return (node.textContent || node.innerText || value).replace(/\s+/g, ' ').trim();
+        }
+        if (value && typeof value === 'object') {
+            return value.message || value.error || value.code || JSON.stringify(value);
+        }
+        return String(value || '').trim();
+    }
+
+    function reportWooError(message, data) {
+        var text = textFromError(message);
+        if (!session || !session.session_id || !text) return;
+        var dedupeKey = session.session_id + ':' + text;
+        if (dedupeKey === lastReportedWooError) return;
+        lastReportedWooError = dedupeKey;
+        sendDiagnostic('woocommerce.checkout_error', $.extend({
+            source: 'woocommerce',
+            checkout_url: window.location.href,
+            user_agent: navigator.userAgent
+        }, data || {}), 'error', text);
+    }
+
+    $(document.body).on('checkout_error.pkplusDiagnostics', function (event, errorMessage) {
+        reportWooError(errorMessage || 'WooCommerce checkout error', { source: 'checkout_error_event' });
+    });
+
+    $(document).ajaxError(function (event, jqxhr, settings, errorThrown) {
+        var url = settings && settings.url ? String(settings.url) : '';
+        if (!/wc-ajax=(checkout|update_order_review)|\/wc-api\//.test(url)) return;
+        reportWooError(errorThrown || jqxhr && jqxhr.responseText || 'WooCommerce checkout request failed', {
+            source: 'ajax_error',
+            request_url: url,
+            status: jqxhr && jqxhr.status || 0,
+            response: jqxhr && jqxhr.responseText ? String(jqxhr.responseText).slice(0, 2000) : ''
+        });
+    });
+
+    window.addEventListener('error', function (event) {
+        reportWooError(event.message || 'Checkout browser error', {
+            source: 'window.error',
+            filename: event.filename || '',
+            line: event.lineno || null,
+            column: event.colno || null
+        });
+    });
+
+    window.addEventListener('unhandledrejection', function (event) {
+        reportWooError(event.reason && event.reason.message || event.reason || 'Checkout promise rejected', {
+            source: 'window.unhandledrejection'
+        });
+    });
+
+    function watchWooErrorNotices() {
+        if (!document.body || !window.MutationObserver) return;
+        var observer = new MutationObserver(function () {
+            $('.woocommerce-error, .woocommerce-NoticeGroup-checkout, .wc-block-components-notice-banner.is-error').each(function () {
+                var text = textFromError($(this).html());
+                if (text) reportWooError(text, { source: 'visible_woocommerce_notice' });
+            });
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    watchWooErrorNotices();
 
     // The 3DS popup returns to the classic checkout URL. Relay the provider
     // result back to the iframe that opened this popup, then close this tab.
@@ -44,6 +137,7 @@
         });
         $('#pkplus-classic-checkout-frame-wrap').empty().append(frame);
         frame.on('load', function () {
+            sendDiagnostic('iframe.loaded', { iframe_url: src, cross_origin: true });
             sendCustomerData();
         });
     }
@@ -86,8 +180,10 @@
                 return;
             }
             loadFrame(response.data);
+            sendDiagnostic('session.received', { checkout_flow: 'iframe' });
             status('');
         }).fail(function () {
+            sendDiagnostic('session.create_failed', {}, 'error', 'Unable to create checkout session.');
             status('Unable to start secure checkout. Please try again.', true);
         }).always(function () {
             creating = false;
@@ -112,6 +208,10 @@
 
     $(function () {
         if (!$('#pkplus-classic-checkout-container').length) return;
+        if (checkoutFlow === 'redirect') {
+            status('You will be redirected to PKPay+ after placing the order.');
+            return;
+        }
         createSession();
         $(document.body).on('input change', 'form.checkout input, form.checkout select, form.checkout textarea', sendCustomerData);
         $(document.body).on('updated_checkout', function () {
@@ -131,6 +231,7 @@
                 status('Payment verified. Submitting order…');
                 submitWooCommerceForm();
             } else if (data.event === 'paymentError') {
+                sendDiagnostic('iframe.paymentError', data, 'error', data.message || 'Payment failed.');
                 paymentComplete = false;
                 submitting = false;
                 status(data.message || 'Payment failed. Please try again.', true);
@@ -138,6 +239,7 @@
         });
 
         $('form.checkout').on('click', '#place_order', function (event) {
+            if (checkoutFlow === 'redirect') return;
             if (paymentComplete || submitting) return;
             if (!frame || !frame[0] || !frame[0].contentWindow) {
                 event.preventDefault();

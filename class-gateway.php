@@ -46,9 +46,7 @@ class PkplusSecuredCheckoutClient extends WC_Payment_Gateway {
     public function init_form_fields() {
         $backend_default_url = defined( 'PKPLUS_BACKEND_URL' ) && PKPLUS_BACKEND_URL
             ? rtrim( trim( (string) PKPLUS_BACKEND_URL ), '/' )
-            : ( ( defined( 'PAYDIOS_BACKEND_URL' ) && PAYDIOS_BACKEND_URL )
-                ? rtrim( trim( (string) PAYDIOS_BACKEND_URL ), '/' )
-                : 'https://api.pkpayplus.com' );
+            : 'https://api.pkpayplus.com';
 
         $this->form_fields = array(
             'merchant_id' => array(
@@ -186,6 +184,12 @@ class PkplusSecuredCheckoutClient extends WC_Payment_Gateway {
 
         $verify_url = pkplus_checkout_get_backend_url() . "/merchant-api/{$merchant_id}/{$session_id}";
 
+        pkplus_checkout_send_server_diagnostic( $session_id, 'woocommerce.verify.request', array(
+            'order_id' => $order->get_id(),
+            'merchant_id' => $merchant_id,
+            'verify_url' => $verify_url,
+        ), 'info', 'WooCommerce is verifying the checkout session.' );
+
         $response = wp_remote_get($verify_url, [
             'headers' => [
                 'Authorization' => 'Bearer ' . $secret_key,
@@ -195,16 +199,36 @@ class PkplusSecuredCheckoutClient extends WC_Payment_Gateway {
         ]);
 
         if (is_wp_error($response)) {
+            pkplus_checkout_send_server_diagnostic( $session_id, 'woocommerce.verify.transport_error', array(
+                'order_id' => $order->get_id(),
+                'merchant_id' => $merchant_id,
+                'error' => $response->get_error_message(),
+            ), 'error', 'WooCommerce could not reach the PKPay+ verification endpoint.' );
             $order->add_order_note('Could not reach Pkplus backend: ' . $response->get_error_message());
             return ['result' => 'failure'];
         }
 
-        $body = json_decode(wp_remote_retrieve_body($response), true);
+        $http_status = wp_remote_retrieve_response_code( $response );
+        $raw_body = wp_remote_retrieve_body( $response );
+        $body = json_decode( $raw_body, true );
+
+        pkplus_checkout_send_server_diagnostic( $session_id, 'woocommerce.verify.response', array(
+            'order_id' => $order->get_id(),
+            'merchant_id' => $merchant_id,
+            'http_status' => $http_status,
+            'response' => is_array( $body ) ? $body : array( 'raw_body' => substr( (string) $raw_body, 0, 4000 ) ),
+        ), ( $http_status >= 400 ? 'error' : 'info' ), 'WooCommerce received the PKPay+ verification response.' );
 
         if (isset($body['status']) && $body['status'] === 'paid') {
             $order->payment_complete($session_id);
             $order->add_order_note('Pkplus payment confirmed via backend.');
             WC()->cart->empty_cart();
+
+            pkplus_checkout_send_server_diagnostic( $session_id, 'woocommerce.order.payment_complete', array(
+                'order_id' => $order->get_id(),
+                'order_status' => $order->get_status(),
+                'transaction_id' => $session_id,
+            ), 'info', 'WooCommerce marked the order payment complete.' );
 
             $redirect_url = $order->get_checkout_order_received_url();
 
@@ -213,6 +237,12 @@ class PkplusSecuredCheckoutClient extends WC_Payment_Gateway {
                 'redirect' => $redirect_url
             ];
         } else {
+            pkplus_checkout_send_server_diagnostic( $session_id, 'woocommerce.verify.not_paid', array(
+                'order_id' => $order->get_id(),
+                'http_status' => $http_status,
+                'response_status' => is_array( $body ) ? ( $body['status'] ?? null ) : null,
+                'response' => is_array( $body ) ? $body : array(),
+            ), 'error', 'WooCommerce received a verification response that was not paid.' );
             $order->update_status('failed', 'Pkplus payment verification failed.');
             wc_add_notice(__('Payment not verified. Please try again.', 'pkpay-secured-checkout'), 'error');
             return ['result' => 'failure'];
@@ -375,15 +405,11 @@ class PkplusSecuredCheckoutClient extends WC_Payment_Gateway {
             $session_id = sanitize_text_field( $payload['id'] );
         }
         $redirect_url = '';
-        if ( ! empty( $payload['redirect_url'] ) ) {
-            $redirect_url = esc_url_raw( $payload['redirect_url'] );
-        } elseif ( ! empty( $payload['checkout_url'] ) ) {
-            $redirect_url = esc_url_raw( $payload['checkout_url'] );
-        } elseif ( ! empty( $payload['url'] ) ) {
-            $redirect_url = esc_url_raw( $payload['url'] );
-        }
-        if ( empty( $redirect_url ) && ! empty( $session_id ) ) {
-            $redirect_url = 'https://pay-session.pkpayplus.com/s/' . rawurlencode( $session_id );
+        if ( ! empty( $session_id ) ) {
+            $redirect_base_url = function_exists( 'pkplus_checkout_get_redirect_url' )
+                ? pkplus_checkout_get_redirect_url()
+                : 'https://pay.pkpayplus.com';
+            $redirect_url = $redirect_base_url . '/s/' . rawurlencode( $session_id );
         }
 
         if ( empty( $session_id ) || empty( $redirect_url ) ) {

@@ -23,10 +23,6 @@ function pkplus_checkout_get_backend_url() {
     if ( defined( 'PKPLUS_BACKEND_URL' ) && PKPLUS_BACKEND_URL ) {
         return rtrim( trim( (string) PKPLUS_BACKEND_URL ), '/' );
     }
-    if ( defined( 'PAYDIOS_BACKEND_URL' ) && PAYDIOS_BACKEND_URL ) {
-        return rtrim( trim( (string) PAYDIOS_BACKEND_URL ), '/' );
-    }
-
     return 'https://api.pkpayplus.com';
 }
 
@@ -36,6 +32,37 @@ function pkplus_checkout_get_iframe_url() {
     }
 
     return 'https://pay-inline.pkpayplus.com';
+}
+
+function pkplus_checkout_get_redirect_url() {
+    if ( defined( 'PKPLUS_REDIRECT_URL' ) && PKPLUS_REDIRECT_URL ) {
+        return rtrim( trim( (string) PKPLUS_REDIRECT_URL ), '/' );
+    }
+
+    return 'https://pay.pkpayplus.com';
+}
+
+function pkplus_checkout_send_server_diagnostic( $session_id, $event, $data = array(), $level = 'info', $message = '' ) {
+    $session_id = sanitize_text_field( (string) $session_id );
+    if ( $session_id === '' ) {
+        return;
+    }
+
+    $api_url = rtrim( pkplus_checkout_get_backend_url(), '/' )
+        . '/client-api/checkout-sessions/' . rawurlencode( $session_id ) . '/diagnostics';
+
+    wp_remote_post( $api_url, array(
+        'headers' => array( 'Content-Type' => 'application/json' ),
+        'body' => wp_json_encode( array(
+            'event' => sanitize_text_field( (string) $event ),
+            'level' => in_array( $level, array( 'debug', 'info', 'warning', 'error' ), true ) ? $level : 'info',
+            'message' => sanitize_text_field( (string) $message ),
+            'data' => is_array( $data ) ? $data : array(),
+            'url' => $api_url,
+        ) ),
+        'timeout' => 5,
+        'blocking' => false,
+    ) );
 }
 
 function pkplus_checkout_default_gateway_settings() {
@@ -428,9 +455,85 @@ function pkplus_checkout_bypass_payment_method_validation() {
 add_action('template_redirect', 'pkplus_checkout_handle_checkout_order_received');
 function pkplus_checkout_handle_checkout_order_received() {
     global $woocommerce;
-    if (is_order_received_page()) {
+    if (!is_order_received_page()) {
+        return;
+    }
+
+    if ( $woocommerce && $woocommerce->cart ) {
         $woocommerce->cart->empty_cart();
     }
+
+    $return_state = sanitize_text_field( (string) ( $_GET['pkplus_return'] ?? '' ) );
+    if ( $return_state !== 'success' ) {
+        return;
+    }
+
+    $order_id = absint( $_GET['order_id'] ?? 0 );
+    $order_key = sanitize_text_field( wp_unslash( (string) ( $_GET['order_key'] ?? '' ) ) );
+    $order = $order_id ? wc_get_order( $order_id ) : false;
+    if ( ! $order || ! $order_key || ! hash_equals( (string) $order->get_order_key(), $order_key ) ) {
+        return;
+    }
+
+    $session_id = sanitize_text_field( (string) $order->get_meta( '_pkplus_session_id' ) );
+    $merchant_id = sanitize_text_field( (string) get_option( 'pkplus_client_merchant_id' ) );
+    $secret_key = sanitize_text_field( (string) get_option( 'pkplus_client_secret_key' ) );
+    if ( ! $session_id || ! $merchant_id || ! $secret_key ) {
+        $order->add_order_note( 'PKPay+ return verification skipped: missing session or merchant credentials.' );
+        return;
+    }
+
+    $verify_url = rtrim( pkplus_checkout_get_backend_url(), '/' )
+        . '/merchant-api/' . rawurlencode( $merchant_id ) . '/' . rawurlencode( $session_id );
+
+    pkplus_checkout_send_server_diagnostic( $session_id, 'woocommerce.verify.request', array(
+        'order_id' => $order_id,
+        'merchant_id' => $merchant_id,
+        'verify_url' => $verify_url,
+        'source' => 'redirect_return',
+    ), 'info', 'WooCommerce is verifying the redirect checkout return.' );
+
+    $response = wp_remote_get( $verify_url, array(
+        'headers' => array(
+            'Authorization' => 'Bearer ' . $secret_key,
+            'Content-Type' => 'application/json',
+        ),
+        'timeout' => 15,
+    ) );
+
+    if ( is_wp_error( $response ) ) {
+        pkplus_checkout_send_server_diagnostic( $session_id, 'woocommerce.verify.transport_error', array(
+            'order_id' => $order_id,
+            'error' => $response->get_error_message(),
+            'source' => 'redirect_return',
+        ), 'error', 'WooCommerce could not verify the redirect checkout return.' );
+        $order->add_order_note( 'PKPay+ redirect verification failed: ' . $response->get_error_message() );
+        return;
+    }
+
+    $http_status = wp_remote_retrieve_response_code( $response );
+    $raw_body = wp_remote_retrieve_body( $response );
+    $body = json_decode( $raw_body, true );
+    $body = is_array( $body ) ? $body : array();
+
+    pkplus_checkout_send_server_diagnostic( $session_id, 'woocommerce.verify.response', array(
+        'order_id' => $order_id,
+        'http_status' => $http_status,
+        'response' => $body ?: array( 'raw_body' => substr( (string) $raw_body, 0, 4000 ) ),
+        'source' => 'redirect_return',
+    ), $http_status >= 400 ? 'error' : 'info', 'WooCommerce received the redirect checkout verification response.' );
+
+    if ( ( $body['status'] ?? '' ) === 'paid' ) {
+        if ( ! $order->is_paid() ) {
+            $order->payment_complete( $session_id );
+            $order->add_order_note( 'PKPay+ redirect payment confirmed by backend.' );
+        }
+        return;
+    }
+
+    $order->add_order_note(
+        'PKPay+ redirect verification returned status: ' . sanitize_text_field( (string) ( $body['status'] ?? 'unknown' ) )
+    );
 }
 
 add_action('enqueue_block_assets', 'pkplus_checkout_enqueue_custom_checkout_script');
@@ -444,18 +547,27 @@ function pkplus_checkout_enqueue_custom_checkout_script() {
     // Classic checkout has its own adapter. The Blocks integration continues
     // to load its existing script through the WooCommerce Blocks registry.
     if ( ! function_exists( 'has_block' ) || ! has_block( 'woocommerce/checkout' ) ) {
+        $classic_checkout_flow = pkplus_checkout_get_effective_setting(
+            'checkout_flow',
+            'pkplus_client_checkout_flow',
+            'iframe'
+        );
+
         wp_enqueue_script(
             'pkplus-classic-checkout',
             plugins_url( 'classic-checkout.js', __FILE__ ),
             array( 'jquery' ),
-            '1.0.1',
+            '1.0.3',
             true
         );
         wp_localize_script( 'pkplus-classic-checkout', 'pkplus_classic_settings', array(
             'ajax_url'          => WC_AJAX::get_endpoint( 'pkplusCreateSession' ),
+            'diagnostic_ajax_url' => WC_AJAX::get_endpoint( 'pkplusDiagnostics' ),
             'nonce'             => wp_create_nonce( 'pkplus_create_session' ),
             'iframe_url'        => pkplus_checkout_get_iframe_url(),
+            'diagnostic_url'    => rtrim( pkplus_checkout_get_backend_url(), '/' ) . '/client-api/checkout-sessions/{session_id}/diagnostics',
             'publishable_key'   => get_option( 'pkplus_client_publishable_key', '' ),
+            'checkout_flow'     => $classic_checkout_flow === 'redirect' ? 'redirect' : 'iframe',
             'three_ds_return_url' => add_query_arg( 'pkplus_3ds_return', '1', wc_get_checkout_url() ),
         ) );
     }
@@ -500,6 +612,41 @@ function pkplus_checkout_create_checkout_page() {
 
 add_action('wc_ajax_pkplusCreateSession', 'pkplus_ajax_create_session');
 add_action('wc_ajax_nopriv_pkplusCreateSession', 'pkplus_ajax_create_session');
+
+add_action('wc_ajax_pkplusDiagnostics', 'pkplus_ajax_send_diagnostic');
+add_action('wc_ajax_nopriv_pkplusDiagnostics', 'pkplus_ajax_send_diagnostic');
+
+function pkplus_ajax_send_diagnostic() {
+    if ( false === check_ajax_referer( 'pkplus_create_session', '_wpnonce', false ) ) {
+        wp_send_json_error([ 'message' => 'Invalid diagnostic security token.' ], 403);
+    }
+
+    $request_body = json_decode( file_get_contents( 'php://input' ), true );
+    $request_body = is_array( $request_body ) ? $request_body : [];
+    $session_id = sanitize_text_field( (string) ($request_body['session_id'] ?? '') );
+
+    if ($session_id === '') {
+        wp_send_json_error([ 'message' => 'Missing checkout session ID.' ], 422);
+    }
+
+    $request_body['event'] = sanitize_text_field( (string) ($request_body['event'] ?? 'unknown') );
+    $api_url = rtrim( pkplus_checkout_get_backend_url(), '/' )
+        . '/client-api/checkout-sessions/' . rawurlencode( $session_id ) . '/diagnostics';
+    unset($request_body['session_id']);
+
+    $response = wp_remote_post($api_url, [
+        'headers' => [ 'Content-Type' => 'application/json' ],
+        'body' => wp_json_encode($request_body),
+        'timeout' => 5,
+        'blocking' => false,
+    ]);
+
+    if (is_wp_error($response)) {
+        wp_send_json_error([ 'message' => $response->get_error_message() ], 502);
+    }
+
+    wp_send_json_success([ 'queued' => true ]);
+}
 
 function pkplus_ajax_create_session() {
     if ( false === check_ajax_referer( 'pkplus_create_session', '_wpnonce', false ) ) {
@@ -648,15 +795,8 @@ function pkplus_ajax_create_session() {
             $iframe_url = esc_url_raw( $data['iframe_url'] );
         }
         $redirect_url = '';
-        if ( ! empty( $data['redirect_url'] ) ) {
-            $redirect_url = esc_url_raw( $data['redirect_url'] );
-        } elseif ( ! empty( $data['checkout_url'] ) ) {
-            $redirect_url = esc_url_raw( $data['checkout_url'] );
-        } elseif ( ! empty( $data['url'] ) ) {
-            $redirect_url = esc_url_raw( $data['url'] );
-        }
-        if ( empty( $redirect_url ) ) {
-            $redirect_url = 'https://pay-session.pkpayplus.com/s/' . rawurlencode( $session_id );
+        if ( ! empty( $session_id ) ) {
+            $redirect_url = pkplus_checkout_get_redirect_url() . '/s/' . rawurlencode( $session_id );
         }
 
         wp_send_json_success([

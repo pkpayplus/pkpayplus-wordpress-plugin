@@ -55,6 +55,7 @@ final class PkplusSecuredCheckoutClient_Blocks extends AbstractPaymentMethodType
             'description'     => __('Securely pay using Pkplus Checkout.', 'pkpay-secured-checkout'),
             'supports'        => $this->gateway->supports,
             'iframe_url'      => pkplus_checkout_get_iframe_url(),
+            'diagnostic_url'  => rtrim( pkplus_checkout_get_backend_url(), '/' ) . '/client-api/checkout-sessions/{session_id}/diagnostics',
             'publishable_key' => get_option('pkplus_client_publishable_key'),
             'checkout_flow'   => $checkout_flow,
             'three_ds_return_url' => add_query_arg(
@@ -62,6 +63,7 @@ final class PkplusSecuredCheckoutClient_Blocks extends AbstractPaymentMethodType
                 wc_get_checkout_url()
             ),
             'create_session_nonce' => wp_create_nonce( 'pkplus_create_session' ),
+            'diagnostic_ajax_url' => WC_AJAX::get_endpoint( 'pkplusDiagnostics' ),
         ];
     }
 }
