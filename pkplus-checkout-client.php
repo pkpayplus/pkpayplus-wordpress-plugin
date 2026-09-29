@@ -42,6 +42,29 @@ function pkplus_checkout_get_redirect_url() {
     return 'https://pay.pkpayplus.com';
 }
 
+/**
+ * Check the backend's signed payment-success marker before making another
+ * synchronous verification request during the browser return.
+ */
+function pkplus_checkout_webhook_payment_confirmed( $order, $session_id = '' ) {
+    if ( ! $order || ! is_object( $order ) ) {
+        return false;
+    }
+
+    $webhook_status = sanitize_text_field( (string) $order->get_meta( '_pkplus_webhook_payment_status' ) );
+    $webhook_session = sanitize_text_field( (string) $order->get_meta( '_pkplus_webhook_session_id' ) );
+
+    if ( $webhook_status !== 'paid' || $webhook_session === '' || (string) $session_id !== $webhook_session ) {
+        return false;
+    }
+
+    if ( ! $order->is_paid() ) {
+        $order->payment_complete( $webhook_session );
+    }
+
+    return true;
+}
+
 function pkplus_checkout_send_server_diagnostic( $session_id, $event, $data = array(), $level = 'info', $message = '' ) {
     $session_id = sanitize_text_field( (string) $session_id );
     if ( $session_id === '' ) {
@@ -453,6 +476,82 @@ function pkplus_checkout_bypass_payment_method_validation() {
 }
 
 add_action('template_redirect', 'pkplus_checkout_handle_checkout_order_received');
+add_action('woocommerce_api_pkplus_callback', 'pkplus_checkout_handle_payment_webhook');
+
+function pkplus_checkout_handle_payment_webhook() {
+    $raw_body = file_get_contents( 'php://input' );
+    $payload = json_decode( (string) $raw_body, true );
+    $payload = is_array( $payload ) ? $payload : array();
+
+    $order_id = absint( $_GET['order_id'] ?? ( $payload['order_id'] ?? 0 ) );
+    $order_key = sanitize_text_field( wp_unslash( (string) ( $_GET['order_key'] ?? '' ) ) );
+    $webhook_token = sanitize_text_field( wp_unslash( (string) ( $_GET['pkplus_webhook_token'] ?? '' ) ) );
+    $session_id = sanitize_text_field( (string) ( $payload['session_id'] ?? '' ) );
+    $order = $order_id ? wc_get_order( $order_id ) : false;
+
+    if ( ! $order && $session_id && function_exists( 'wc_get_orders' ) ) {
+        $orders = wc_get_orders( array(
+            'limit' => 1,
+            'return' => 'objects',
+            'meta_key' => '_pkplus_session_id',
+            'meta_value' => $session_id,
+        ) );
+        $order = ! empty( $orders ) ? $orders[0] : false;
+    }
+
+    if ( ! $order ) {
+        status_header( 401 );
+        wp_send_json_error( array( 'message' => 'WooCommerce order was not found for this checkout session.' ), 401 );
+    }
+
+    $signature = sanitize_text_field( (string) ( $_SERVER['HTTP_X_PKPLUS_SIGNATURE'] ?? '' ) );
+    if ( $order_key !== '' && ! hash_equals( (string) $order->get_order_key(), $order_key ) ) {
+        status_header( 401 );
+        wp_send_json_error( array( 'message' => 'Invalid WooCommerce order credentials.' ), 401 );
+    }
+
+    $signature_key = $order_key !== '' ? $order_key : $webhook_token;
+    if ( $signature_key === '' ) {
+        status_header( 401 );
+        wp_send_json_error( array( 'message' => 'Missing PKPay+ webhook credentials.' ), 401 );
+    }
+
+    $expected_signature = hash_hmac( 'sha256', (string) $raw_body, $signature_key );
+    if ( $signature === '' || ! hash_equals( $expected_signature, $signature ) ) {
+        status_header( 401 );
+        wp_send_json_error( array( 'message' => 'Invalid PKPay+ webhook signature.' ), 401 );
+    }
+
+    $stored_session_id = sanitize_text_field( (string) $order->get_meta( '_pkplus_session_id' ) );
+    if ( $session_id === '' || ( $stored_session_id !== '' && $stored_session_id !== $session_id ) ) {
+        status_header( 409 );
+        wp_send_json_error( array( 'message' => 'Checkout session does not match the WooCommerce order.' ), 409 );
+    }
+
+    if ( ( $payload['event'] ?? '' ) !== 'payment.succeeded' || ( $payload['status'] ?? '' ) !== 'paid' ) {
+        status_header( 422 );
+        wp_send_json_error( array( 'message' => 'Unsupported or unpaid PKPay+ webhook event.' ), 422 );
+    }
+
+    $order->update_meta_data( '_pkplus_webhook_payment_status', 'paid' );
+    $order->update_meta_data( '_pkplus_webhook_session_id', $session_id );
+    $order->update_meta_data( '_pkplus_webhook_transaction_id', sanitize_text_field( (string) ( $payload['transaction_id'] ?? '' ) ) );
+    $order->update_meta_data( '_pkplus_webhook_received_at', current_time( 'mysql', true ) );
+
+    if ( ! $order->is_paid() ) {
+        $order->payment_complete( sanitize_text_field( (string) ( $payload['transaction_id'] ?? $session_id ) ) );
+    }
+
+    $order->save();
+
+    wp_send_json_success( array(
+        'received' => true,
+        'order_id' => $order_id,
+        'session_id' => $session_id,
+        'status' => 'paid',
+    ) );
+}
+
 function pkplus_checkout_handle_checkout_order_received() {
     global $woocommerce;
     if (!is_order_received_page()) {
@@ -476,6 +575,10 @@ function pkplus_checkout_handle_checkout_order_received() {
     }
 
     $session_id = sanitize_text_field( (string) $order->get_meta( '_pkplus_session_id' ) );
+    if ( pkplus_checkout_webhook_payment_confirmed( $order, $session_id ) ) {
+        return;
+    }
+
     $merchant_id = sanitize_text_field( (string) get_option( 'pkplus_client_merchant_id' ) );
     $secret_key = sanitize_text_field( (string) get_option( 'pkplus_client_secret_key' ) );
     if ( ! $session_id || ! $merchant_id || ! $secret_key ) {
@@ -704,7 +807,11 @@ function pkplus_ajax_create_session() {
     $success_return_url = add_query_arg( 'pkplus_return', 'success', $checkout_url );
     $cancel_return_url  = add_query_arg( 'pkplus_return', 'cancel', $checkout_url );
     $three_ds_return_url = add_query_arg( 'pkplus_3ds_return', '1', $checkout_url );
-    $callback_url       = add_query_arg( 'wc-api', 'pkplus_callback', home_url( '/' ) );
+    $webhook_token      = wp_generate_password( 64, false, false );
+    $callback_url       = add_query_arg( array(
+        'wc-api' => 'pkplus_callback',
+        'pkplus_webhook_token' => $webhook_token,
+    ), home_url( '/' ) );
     $current_user = wp_get_current_user();
     $customer = WC()->customer;
 
