@@ -177,7 +177,14 @@ class PkplusSecuredCheckoutClient extends WC_Payment_Gateway {
             wc_add_notice(__('Payment verification failed: Missing session ID.', 'pkpay-secured-checkout'), 'error');
             return ['result' => 'failure'];
         }
-
+       if ( function_exists( 'pkplus_checkout_webhook_payment_confirmed' )
+            && pkplus_checkout_webhook_payment_confirmed( $order, $session_id ) ) {
+            return [
+                'result'   => 'success',
+                'redirect' => $order->get_checkout_order_received_url(),
+            ];
+        }
+        
         $publishable_key = get_option('pkplus_client_publishable_key');
         $secret_key      = get_option('pkplus_client_secret_key');
         $merchant_id     = get_option('pkplus_client_merchant_id');
