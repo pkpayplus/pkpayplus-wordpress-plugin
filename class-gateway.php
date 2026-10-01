@@ -178,14 +178,6 @@ class PkplusSecuredCheckoutClient extends WC_Payment_Gateway {
             return ['result' => 'failure'];
         }
 
-        if ( function_exists( 'pkplus_checkout_webhook_payment_confirmed' )
-            && pkplus_checkout_webhook_payment_confirmed( $order, $session_id ) ) {
-            return [
-                'result'   => 'success',
-                'redirect' => $order->get_checkout_order_received_url(),
-            ];
-        }
-
         $publishable_key = get_option('pkplus_client_publishable_key');
         $secret_key      = get_option('pkplus_client_secret_key');
         $merchant_id     = get_option('pkplus_client_merchant_id');
@@ -255,6 +247,28 @@ class PkplusSecuredCheckoutClient extends WC_Payment_Gateway {
             wc_add_notice(__('Payment not verified. Please try again.', 'pkpay-secured-checkout'), 'error');
             return ['result' => 'failure'];
         }
+    }
+
+    /**
+     * Thumbnail for a line item, for display on the hosted checkout.
+     */
+    private function line_item_image_url( $item ) {
+        $override = (string) $item->get_meta( '_pkplus_image_url' );
+        if ( '' !== $override ) {
+            return esc_url_raw( $override );
+        }
+        $product = $item->get_product();
+        if ( ! $product ) {
+            return '';
+        }
+
+        $image_id = $product->get_image_id();
+        if ( ! $image_id ) {
+            return '';
+        }
+        $url = wp_get_attachment_image_url( $image_id, 'woocommerce_thumbnail' );
+
+        return $url ? esc_url_raw( $url ) : '';
     }
 
     private function create_redirect_session_for_order( WC_Order $order ) {
@@ -327,6 +341,7 @@ class PkplusSecuredCheckoutClient extends WC_Payment_Gateway {
                 'quantity'     => (int) $item->get_quantity(),
                 'line_total'   => (string) $item->get_total(),
                 'line_tax'     => (string) $item->get_total_tax(),
+                'image_url'    => $this->line_item_image_url( $item ),
             );
         }
 
